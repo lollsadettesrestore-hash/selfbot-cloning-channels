@@ -876,8 +876,10 @@ client.on("ready", async () => {
       console.log(`\n👂 Modalità CLONE SERVER pronta — scrivi ,clearserver per avviare`);
     } else if (SOURCE_THREAD_ID && TARGET_THREAD_ID) {
       await runThreadMode();
+      process.exit(0);
     } else if (SOURCE_CATEGORY_ID && TARGET_CATEGORY_ID) {
       await runCategoryMode();
+      process.exit(0);
     } else {
       // Modalità standby: aspetta comandi
       console.log(`\n👂 In ascolto comandi (,clearserver)...`);
