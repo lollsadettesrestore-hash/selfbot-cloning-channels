@@ -133,6 +133,10 @@ async function createAllWebhooks(channelPairs) {
 
 // ─── Scraping messaggi (video + foto) ────────────────────────────────────────
 async function scrapeMessages(channel) {
+  if (!channel?.messages) {
+    console.error(`❌ Canale ${channel?.id ?? "sconosciuto"} non ha il message manager — guild non in cache?`);
+    return [];
+  }
   const media = [];
   const seen = new Set();
   let lastId = null;
@@ -510,7 +514,16 @@ async function findCategory(categoryId) {
 // ─── Trova un thread/channel per ID ──────────────────────────────────────────
 async function findChannelById(id) {
   try {
-    return await client.channels.fetch(id);
+    const channel = await client.channels.fetch(id);
+    // Se è un thread, fetchare guild.channels non basta — i thread
+    // non compaiono lì. Bisogna fetchare i thread del canale padre
+    // così il message manager viene inizializzato correttamente.
+    if (channel?.isThread?.() && channel.parent) {
+      await channel.parent.threads.fetchActive().catch(() => {});
+    } else if (channel?.guild) {
+      await channel.guild.channels.fetch().catch(() => {});
+    }
+    return channel;
   } catch (e) {
     console.error(`❌ Impossibile trovare canale/thread ${id}: ${e.message}`);
     return null;
