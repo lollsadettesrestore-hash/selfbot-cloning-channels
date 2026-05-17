@@ -874,6 +874,12 @@ client.on("ready", async () => {
 
     if (SOURCE_GUILD_ID && TARGET_GUILD_ID) {
       console.log(`\n👂 Modalità CLONE SERVER pronta — scrivi ,clearserver per avviare`);
+      // Avvia anche il mirror media in parallelo se configurato
+      if (SOURCE_CATEGORY_ID && TARGET_CATEGORY_ID) {
+        runCategoryMode().then(() => console.log(`\n✅ Mirror categorie completato!`)).catch((e) => console.error(`💥 Mirror categorie: ${e.message}`));
+      } else if (SOURCE_THREAD_ID && TARGET_THREAD_ID) {
+        runThreadMode().then(() => console.log(`\n✅ Mirror thread completato!`)).catch((e) => console.error(`💥 Mirror thread: ${e.message}`));
+      }
     } else if (SOURCE_THREAD_ID && TARGET_THREAD_ID) {
       await runThreadMode();
       process.exit(0);
