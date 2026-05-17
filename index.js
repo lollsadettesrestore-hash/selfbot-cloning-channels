@@ -140,56 +140,28 @@ async function scrapeMessages(channel) {
 
   while (true) {
     try {
-      const params = { limit: 100 };
-      if (lastId) params.before = lastId;
+      const options = { limit: 100 };
+      if (lastId) options.before = lastId;
 
-      // Usa axios direttamente — bypassa il message manager di discord.js
-      // che sui thread spesso risulta undefined nei selfbot
-      const res = await axios.get(
-        `https://discord.com/api/v10/channels/${channel.id}/messages`,
-        {
-          headers: { Authorization: TOKEN },
-          params,
-          validateStatus: () => true,
-        }
-      );
+      const messages = await channel.messages.fetch(options);
+      if (messages.size === 0) break;
 
-      if (res.status === 429) {
-        const retryAfter = (res.data?.retry_after ?? 3) + 0.5;
-        console.warn(`  ⏳ Rate limit fetch messaggi — aspetto ${retryAfter}s`);
-        await sleep(retryAfter * 1000);
-        continue;
-      }
-
-      if (res.status !== 200) {
-        console.error(`❌ Errore fetch messaggi in #${channel.name}: status ${res.status} — riprovo tra 3s`);
-        await sleep(3000);
-        continue;
-      }
-
-      const messages = res.data;
-      if (!messages || messages.length === 0) break;
-
-      console.log(`  🔍 Batch: ${messages.length} messaggi | primo id=${messages[0]?.id} attachments=${JSON.stringify(messages[0]?.attachments?.length ?? messages[0]?.attachments)} embeds=${messages[0]?.embeds?.length}`);
-
-      const newLastId = messages[messages.length - 1]?.id;
+      const newLastId = messages.last()?.id;
       if (newLastId === lastId) {
         if (++stuckGuard >= 3) { console.warn(`⚠️ Loop bloccato in #${channel.name}, esco.`); break; }
       } else { stuckGuard = 0; }
       lastId = newLastId;
 
-      for (const msg of messages) {
-        // Allegati (video + foto)
-        for (const att of Object.values(msg.attachments ?? {})) {
-          const ext = getMediaExt(att.filename ?? att.name);
+      messages.forEach((msg) => {
+        msg.attachments.forEach((att) => {
+          const ext = getMediaExt(att.name);
           if (ext && !seen.has(att.url)) {
             seen.add(att.url);
             media.push({ url: att.url, ext, messageId: msg.id });
           }
-        }
-        // Embed video/immagini
-        for (const embed of msg.embeds ?? []) {
-          const videoUrl = embed.video?.url || embed.video?.proxy_url;
+        });
+        msg.embeds.forEach((embed) => {
+          const videoUrl = embed.video?.url || embed.video?.proxyURL;
           if (videoUrl && !seen.has(videoUrl)) {
             const ext = getMediaExt(videoUrl);
             if (ext) { seen.add(videoUrl); media.push({ url: videoUrl, ext, messageId: msg.id }); }
@@ -199,8 +171,8 @@ async function scrapeMessages(channel) {
             const ext = getMediaExt(imgUrl);
             if (ext) { seen.add(imgUrl); media.push({ url: imgUrl, ext, messageId: msg.id }); }
           }
-        }
-      }
+        });
+      });
 
       await sleep(500);
     } catch (e) {
@@ -536,13 +508,10 @@ async function findCategory(categoryId) {
 async function findChannelById(id) {
   try {
     const channel = await client.channels.fetch(id);
-    // Se è un thread, fetchare guild.channels non basta — i thread
-    // non compaiono lì. Bisogna fetchare i thread del canale padre
-    // così il message manager viene inizializzato correttamente.
-    if (channel?.isThread?.() && channel.parent) {
-      await channel.parent.threads.fetchActive().catch(() => {});
-    } else if (channel?.guild) {
-      await channel.guild.channels.fetch().catch(() => {});
+    console.log(`  🔍 channel type=${channel?.type} isThread=${channel?.isThread?.()} hasMessages=${!!channel?.messages} guild=${!!channel?.guild}`);
+    if (channel?.guild) {
+      await channel.guild.members.fetchMe().catch(() => {});
+      console.log(`  🔍 dopo fetchMe: hasMessages=${!!channel?.messages}`);
     }
     return channel;
   } catch (e) {
