@@ -133,10 +133,6 @@ async function createAllWebhooks(channelPairs) {
 
 // ─── Scraping messaggi (video + foto) ────────────────────────────────────────
 async function scrapeMessages(channel) {
-  if (!channel?.messages) {
-    console.error(`❌ Canale ${channel?.id ?? "sconosciuto"} non ha il message manager — guild non in cache?`);
-    return [];
-  }
   const media = [];
   const seen = new Set();
   let lastId = null;
@@ -144,42 +140,65 @@ async function scrapeMessages(channel) {
 
   while (true) {
     try {
-      const options = { limit: 100 };
-      if (lastId) options.before = lastId;
+      const params = { limit: 100 };
+      if (lastId) params.before = lastId;
 
-      const messages = await channel.messages.fetch(options);
-      if (messages.size === 0) break;
+      // Usa axios direttamente — bypassa il message manager di discord.js
+      // che sui thread spesso risulta undefined nei selfbot
+      const res = await axios.get(
+        `https://discord.com/api/v10/channels/${channel.id}/messages`,
+        {
+          headers: { Authorization: TOKEN },
+          params,
+          validateStatus: () => true,
+        }
+      );
 
-      const newLastId = messages.last()?.id;
+      if (res.status === 429) {
+        const retryAfter = (res.data?.retry_after ?? 3) + 0.5;
+        console.warn(`  ⏳ Rate limit fetch messaggi — aspetto ${retryAfter}s`);
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+
+      if (res.status !== 200) {
+        console.error(`❌ Errore fetch messaggi in #${channel.name}: status ${res.status} — riprovo tra 3s`);
+        await sleep(3000);
+        continue;
+      }
+
+      const messages = res.data;
+      if (!messages || messages.length === 0) break;
+
+      const newLastId = messages[messages.length - 1]?.id;
       if (newLastId === lastId) {
         if (++stuckGuard >= 3) { console.warn(`⚠️ Loop bloccato in #${channel.name}, esco.`); break; }
       } else { stuckGuard = 0; }
       lastId = newLastId;
 
-      messages.forEach((msg) => {
+      for (const msg of messages) {
         // Allegati (video + foto)
-        msg.attachments.forEach((att) => {
-          const ext = getMediaExt(att.name);
+        for (const att of Object.values(msg.attachments ?? {})) {
+          const ext = getMediaExt(att.filename ?? att.name);
           if (ext && !seen.has(att.url)) {
             seen.add(att.url);
             media.push({ url: att.url, ext, messageId: msg.id });
           }
-        });
-        // Embed video
-        msg.embeds.forEach((embed) => {
-          const videoUrl = embed.video?.url || embed.video?.proxyURL;
+        }
+        // Embed video/immagini
+        for (const embed of msg.embeds ?? []) {
+          const videoUrl = embed.video?.url || embed.video?.proxy_url;
           if (videoUrl && !seen.has(videoUrl)) {
             const ext = getMediaExt(videoUrl);
             if (ext) { seen.add(videoUrl); media.push({ url: videoUrl, ext, messageId: msg.id }); }
           }
-          // Embed immagini
           const imgUrl = embed.image?.url || embed.thumbnail?.url;
           if (imgUrl && !seen.has(imgUrl)) {
             const ext = getMediaExt(imgUrl);
             if (ext) { seen.add(imgUrl); media.push({ url: imgUrl, ext, messageId: msg.id }); }
           }
-        });
-      });
+        }
+      }
 
       await sleep(500);
     } catch (e) {
