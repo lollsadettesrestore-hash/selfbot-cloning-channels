@@ -13,10 +13,18 @@ const INVISIBLE_AVATAR =
 
 const VIDEO_EXTENSIONS = [".mp4", ".mov", ".avi", ".mkv", ".webm"];
 
+// Discord webhook file size limit (25 MB per request for non-boosted servers)
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
 const client = new Client({ checkUpdate: false });
 
 process.on("uncaughtException",  (err) => console.error(`💥 uncaughtException: ${err?.stack || err}`));
 process.on("unhandledRejection", (r)   => console.error(`💥 unhandledRejection: ${r?.stack || r}`));
+
+// ─── Utility ─────────────────────────────────────────────────────────────────
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ─── Progresso ────────────────────────────────────────────────────────────────
 function saveProgress(channelId, sentUrls) {
@@ -42,7 +50,7 @@ function loadProgress(channelId) {
   return new Set();
 }
 
-// ─── Canali e webhook ────────────────────────────────────────────────────────
+// ─── Canali ───────────────────────────────────────────────────────────────────
 async function createChannel(guild, name, categoryId) {
   try {
     const ch = await guild.channels.create(name, { type: "GUILD_TEXT", parent: categoryId });
@@ -54,20 +62,56 @@ async function createChannel(guild, name, categoryId) {
   }
 }
 
-async function createWebhook(channelId) {
-  try {
-    const res = await axios.post(
-      `https://discord.com/api/v10/channels/${channelId}/webhooks`,
-      { name: "UPLOADER", avatar: INVISIBLE_AVATAR },
-      { headers: { Authorization: TOKEN, "Content-Type": "application/json" } }
-    );
-    const { id, token } = res.data;
-    console.log(`✅ Webhook creato nel canale ${channelId}`);
-    return `https://discord.com/api/webhooks/${id}/${token}`;
-  } catch (e) {
-    console.error(`❌ Errore webhook: ${e.response?.status} ${e.message}`);
-    return null;
+// ─── Webhook con retry su 429 ──────────────────────────────────────────────
+// FIX: gestisce il 429 con backoff invece di fallire subito
+async function createWebhook(channelId, retries = 8) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await axios.post(
+        `https://discord.com/api/v10/channels/${channelId}/webhooks`,
+        { name: "UPLOADER", avatar: INVISIBLE_AVATAR },
+        {
+          headers: { Authorization: TOKEN, "Content-Type": "application/json" },
+          validateStatus: () => true,
+        }
+      );
+
+      if (res.status === 429) {
+        // FIX: rispetta il retry_after di Discord invece di fallire
+        const retryAfter = (res.data?.retry_after ?? 5) + 1;
+        console.warn(`  ⏳ Webhook 429 (canale ${channelId}) — aspetto ${retryAfter.toFixed(1)}s (tentativo ${attempt + 1}/${retries})`);
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+
+      if (res.status === 200 || res.status === 201) {
+        const { id, token } = res.data;
+        console.log(`✅ Webhook creato nel canale ${channelId}`);
+        return `https://discord.com/api/webhooks/${id}/${token}`;
+      }
+
+      console.warn(`  ⚠️ Webhook status ${res.status} per canale ${channelId} — ritento (${attempt + 1}/${retries})`);
+      await sleep(2000 * (attempt + 1));
+    } catch (e) {
+      console.error(`❌ Errore webhook: ${e.message} — ritento (${attempt + 1}/${retries})`);
+      await sleep(2000 * (attempt + 1));
+    }
   }
+  console.error(`❌ Webhook fallito definitivamente per canale ${channelId}`);
+  return null;
+}
+
+// ─── Pre-crea tutti i webhook in sequenza ─────────────────────────────────────
+// FIX: invece di creare tutti in parallelo (→ burst di 429),
+//      li crea uno alla volta con una piccola pausa tra l'uno e l'altro.
+async function createAllWebhooks(channelPairs) {
+  const result = [];
+  for (const pair of channelPairs) {
+    const webhookUrl = await createWebhook(pair.target.id);
+    result.push({ ...pair, webhookUrl });
+    if (result.length < channelPairs.length) await sleep(800); // pausa anti-rate-limit
+  }
+  return result;
 }
 
 // ─── Download singolo video con refresh URL Discord ───────────────────────────
@@ -105,7 +149,16 @@ async function downloadVideo(video, channel, retries = 5) {
         continue;
       }
 
-      return { buffer: Buffer.from(res.data), filename: `SENSATIONAL_TEMP${ext}`, url };
+      const buffer = Buffer.from(res.data);
+
+      // FIX: controlla la dimensione prima di restituire il buffer.
+      // Se supera il limite Discord non potrà mai essere caricato → scarta subito.
+      if (buffer.length > MAX_UPLOAD_BYTES) {
+        console.warn(`  ⚠️ File troppo grande (${(buffer.length / 1024 / 1024).toFixed(1)} MB > 25 MB), saltato: ${url}`);
+        return null;
+      }
+
+      return { buffer, filename: `SENSATIONAL_TEMP${ext}`, url };
     } catch (e) {
       console.warn(`  ⚠️ Download fallito (${attempt + 1}/${retries}): ${e.message}`);
       if (attempt < retries - 1) await sleep(2000 * (attempt + 1));
@@ -115,14 +168,13 @@ async function downloadVideo(video, channel, retries = 5) {
   return null;
 }
 
-// ─── Download PARALLELO di una coppia (entrambi i video contemporaneamente) ───
+// ─── Download PARALLELO di una coppia ────────────────────────────────────────
 async function downloadPair(pair, channel) {
-  // Scarica i due video in parallelo invece che in sequenza → dimezza il tempo di download
   const results = await Promise.all(pair.map((video) => downloadVideo(video, channel)));
   const files = [];
   results.forEach((result, i) => {
     if (!result) {
-      console.warn(`  ⚠️ Video ${i + 1} non scaricabile — verrà riprovato.`);
+      console.warn(`  ⚠️ Video ${i + 1} non scaricabile — verrà saltato.`);
       return;
     }
     const filename = `SENSATIONAL${pair.length > 1 ? `_${i + 1}` : ""}${pair[i].ext}`;
@@ -131,17 +183,15 @@ async function downloadPair(pair, channel) {
   return files;
 }
 
-// ─── Invio file già scaricati via webhook ────────────────────────────────────
-async function sendFiles(webhookUrl, files, pairIndex, retries = 6) {
-  if (files.length === 0) return [];
-
+// ─── Invio file via webhook ────────────────────────────────────────────────────
+// FIX principale: se arriva un 413 non ha senso riprovare con lo stesso payload.
+//   → si spezza la coppia e si invia ogni file singolarmente.
+async function sendSingleFile(webhookUrl, file, retries = 5) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const form = new FormData();
       form.append("payload_json", JSON.stringify({ username: "SENSATIONAL" }));
-      files.forEach(({ buffer, filename }, i) => {
-        form.append(`files[${i}]`, buffer, { filename, contentType: "video/mp4" });
-      });
+      form.append("files[0]", file.buffer, { filename: file.filename, contentType: "video/mp4" });
 
       const res = await axios.post(webhookUrl, form, {
         headers: form.getHeaders(),
@@ -152,13 +202,19 @@ async function sendFiles(webhookUrl, files, pairIndex, retries = 6) {
       });
 
       if (res.status === 429) {
-        const retryAfter = (res.data?.retry_after || 3) + 0.5;
+        const retryAfter = (res.data?.retry_after ?? 3) + 0.5;
         console.log(`  ⏳ Rate limit — aspetto ${retryAfter}s`);
         await sleep(retryAfter * 1000);
         continue;
       }
+      if (res.status === 413) {
+        // Non ritentare — il file è intrinsecamente troppo grande (non dovrebbe mai arrivare qui
+        // grazie al controllo in downloadVideo, ma per sicurezza)
+        console.warn(`  ⚠️ File troppo grande per Discord (413), saltato: ${file.filename}`);
+        return null;
+      }
       if (res.status === 200 || res.status === 204) {
-        return files.map((f) => f.url); // URL effettivamente inviate
+        return file.url;
       }
 
       console.warn(`  ⚠️ Status ${res.status} — ritento (${attempt + 1}/${retries})`);
@@ -168,15 +224,75 @@ async function sendFiles(webhookUrl, files, pairIndex, retries = 6) {
       await sleep(4000 * (attempt + 1));
     }
   }
-  return [];
+  return null;
 }
 
-// ─── Mirror con PIPELINE: scarica N+1 mentre invia N ────────────────────────
-async function mirrorChannel(sourceChannel, targetChannel) {
+async function sendFiles(webhookUrl, files) {
+  if (files.length === 0) return [];
+
+  // FIX: controlla se la dimensione totale supera il limite.
+  // In caso, invia ogni file separatamente invece che insieme.
+  const totalSize = files.reduce((sum, f) => sum + f.buffer.length, 0);
+  const sentUrls = [];
+
+  if (files.length === 1 || totalSize <= MAX_UPLOAD_BYTES) {
+    // Prova a inviare tutto insieme
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const form = new FormData();
+        form.append("payload_json", JSON.stringify({ username: "SENSATIONAL" }));
+        files.forEach(({ buffer, filename }, i) => {
+          form.append(`files[${i}]`, buffer, { filename, contentType: "video/mp4" });
+        });
+
+        const res = await axios.post(webhookUrl, form, {
+          headers: form.getHeaders(),
+          validateStatus: () => true,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          timeout: 180000,
+        });
+
+        if (res.status === 429) {
+          const retryAfter = (res.data?.retry_after ?? 3) + 0.5;
+          console.log(`  ⏳ Rate limit — aspetto ${retryAfter}s`);
+          await sleep(retryAfter * 1000);
+          continue;
+        }
+        if (res.status === 413) {
+          // FIX: payload troppo grande → riprova file per file
+          console.warn(`  ⚠️ 413 sul batch — invio file uno per uno`);
+          break; // esce dal loop e va alla logica singola sotto
+        }
+        if (res.status === 200 || res.status === 204) {
+          return files.map((f) => f.url);
+        }
+
+        console.warn(`  ⚠️ Status ${res.status} — ritento (${attempt + 1}/5)`);
+        await sleep(3000 * (attempt + 1));
+      } catch (e) {
+        console.error(`  ❌ Errore invio batch: ${e.message} — ritento (${attempt + 1}/5)`);
+        await sleep(4000 * (attempt + 1));
+      }
+    }
+  }
+
+  // FIX: invio file per file (fallback 413 o payload troppo grande)
+  for (const file of files) {
+    const url = await sendSingleFile(webhookUrl, file);
+    if (url) {
+      sentUrls.push(url);
+      await sleep(500); // piccola pausa tra un file e l'altro
+    }
+  }
+  return sentUrls;
+}
+
+// ─── Mirror con PIPELINE ──────────────────────────────────────────────────────
+async function mirrorChannel(sourceChannel, targetChannel, webhookUrl) {
   try {
-    const webhookUrl = await createWebhook(targetChannel.id);
     if (!webhookUrl) {
-      console.error(`❌ Webhook fallito per #${targetChannel.name}, salto.`);
+      console.error(`❌ Nessun webhook per #${targetChannel.name}, salto.`);
       return;
     }
 
@@ -205,17 +321,14 @@ async function mirrorChannel(sourceChannel, targetChannel) {
 
     for (let i = 0; i < pairs.length; i++) {
       try {
-        // Aspetta che i file della coppia corrente siano pronti
         const files = await nextFilesPromise;
 
-        // PIPELINE: avvia immediatamente il download della coppia successiva
-        // mentre questa viene inviata → download e invio si sovrappongono
+        // PIPELINE: avvia il download della coppia successiva mentre si invia questa
         if (i + 1 < pairs.length) {
           nextFilesPromise = downloadPair(pairs[i + 1], sourceChannel);
         }
 
-        // Invia la coppia corrente (mentre la successiva si scarica in background)
-        const sentNow = await sendFiles(webhookUrl, files, i);
+        const sentNow = await sendFiles(webhookUrl, files);
 
         if (sentNow.length > 0) {
           sentNow.forEach((url) => sentUrls.add(url));
@@ -225,10 +338,9 @@ async function mirrorChannel(sourceChannel, targetChannel) {
           const rate = ((i + 1) / elapsed * 60).toFixed(1);
           console.log(`  [#${sourceChannel.name}] ${i + 1}/${pairs.length} ✅  (${elapsed}s — ~${rate} coppie/min)`);
         } else {
-          console.error(`  [#${sourceChannel.name}] ${i + 1}/${pairs.length} ❌ (verrà riprovato)`);
+          console.error(`  [#${sourceChannel.name}] ${i + 1}/${pairs.length} ❌ (tutti i file saltati o falliti)`);
         }
 
-        // Pausa minima tra un webhook e l'altro (Discord: ~1 req/s per file upload)
         await sleep(1000);
       } catch (e) {
         console.error(`  [#${sourceChannel.name}] coppia ${i + 1} errore imprevisto: ${e.message} — continuo`);
@@ -290,7 +402,7 @@ async function scrapeChannel(channel) {
         });
       });
 
-      await sleep(500); // ridotto da 1000ms
+      await sleep(500);
     } catch (e) {
       console.error(`❌ Errore fetch messaggi in #${channel.name}: ${e.message} — riprovo tra 3s`);
       await sleep(3000);
@@ -349,10 +461,24 @@ client.on("ready", async () => {
       .map((src, i) => ({ source: src, target: targetChannels[i] }))
       .filter((p) => p.source && p.target);
 
-    console.log(`🔗 Coppie di canali: ${channelPairs.length}\n`);
+    console.log(`🔗 Coppie di canali: ${channelPairs.length}`);
+
+    // FIX: crea tutti i webhook in sequenza con pausa anti-rate-limit
+    //      PRIMA di avviare il mirror parallelo dei canali.
+    console.log(`\n🔨 Pre-creazione webhook in sequenza...`);
+    const pairsWithWebhooks = await createAllWebhooks(channelPairs);
+
+    const okCount = pairsWithWebhooks.filter((p) => p.webhookUrl).length;
+    console.log(`✅ Webhook pronti: ${okCount}/${pairsWithWebhooks.length}\n`);
 
     const globalStart = Date.now();
-    await Promise.allSettled(channelPairs.map(({ source, target }) => mirrorChannel(source, target)));
+
+    // I canali girano in parallelo — ogni canale usa il proprio webhook già creato
+    await Promise.allSettled(
+      pairsWithWebhooks.map(({ source, target, webhookUrl }) =>
+        mirrorChannel(source, target, webhookUrl)
+      )
+    );
 
     const totalMin = ((Date.now() - globalStart) / 60000).toFixed(1);
     console.log(`\n🎯 Tutti i canali completati in ${totalMin} minuti!`);
@@ -367,7 +493,3 @@ client.login(TOKEN).catch((e) => {
   console.error(`❌ Login fallito: ${e.message}`);
   process.exit(1);
 });
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
