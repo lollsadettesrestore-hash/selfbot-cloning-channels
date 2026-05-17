@@ -170,6 +170,8 @@ async function scrapeMessages(channel) {
       const messages = res.data;
       if (!messages || messages.length === 0) break;
 
+      console.log(`  🔍 Batch: ${messages.length} messaggi | primo id=${messages[0]?.id} attachments=${JSON.stringify(messages[0]?.attachments?.length ?? messages[0]?.attachments)} embeds=${messages[0]?.embeds?.length}`);
+
       const newLastId = messages[messages.length - 1]?.id;
       if (newLastId === lastId) {
         if (++stuckGuard >= 3) { console.warn(`⚠️ Loop bloccato in #${channel.name}, esco.`); break; }
