@@ -507,23 +507,14 @@ async function findCategory(categoryId) {
   return null;
 }
 
-// ─── Trova un thread/channel per ID in tutti i guild ─────────────────────────
+// ─── Trova un thread/channel per ID ──────────────────────────────────────────
 async function findChannelById(id) {
-  for (const guild of client.guilds.cache.values()) {
-    await guild.channels.fetch().catch(() => {});
-    const ch = guild.channels.cache.get(id);
-    if (ch) return ch;
-    // Cerca anche tra i thread
-    for (const channel of guild.channels.cache.values()) {
-      if (!channel.threads) continue;
-      try {
-        const active = await channel.threads.fetchActive().catch(() => ({ threads: new Map() }));
-        const found = active.threads.get(id);
-        if (found) return found;
-      } catch (_) {}
-    }
+  try {
+    return await client.channels.fetch(id);
+  } catch (e) {
+    console.error(`❌ Impossibile trovare canale/thread ${id}: ${e.message}`);
+    return null;
   }
-  return null;
 }
 
 // ─── Modalità thread: clona SOURCE_THREAD → TARGET_THREAD ────────────────────
