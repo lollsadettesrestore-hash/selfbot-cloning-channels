@@ -873,9 +873,7 @@ client.on("ready", async () => {
     console.log(`\n🤖 Loggato come ${client.user.tag}`);
 
     if (SOURCE_GUILD_ID && TARGET_GUILD_ID) {
-      const start = Date.now();
-      await runCloneMode();
-      console.log(`\n🎯 Clone completato in ${((Date.now()-start)/1000).toFixed(1)}s!`);
+      console.log(`\n👂 Modalità CLONE SERVER pronta — scrivi ,clearserver per avviare`);
     } else if (SOURCE_THREAD_ID && TARGET_THREAD_ID) {
       await runThreadMode();
     } else if (SOURCE_CATEGORY_ID && TARGET_CATEGORY_ID) {
