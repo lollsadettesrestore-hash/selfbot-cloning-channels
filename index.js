@@ -603,7 +603,7 @@ async function runCategoryMode() {
 }
 
 // ─── Clone server: ruoli ─────────────────────────────────────────────────────
-async function cloneRoles(sourceGuild, targetGuildId) {
+async function cloneRoles(sourceGuild, targetGuild) {
   console.log(`\n🎭 Clonazione ruoli...`);
 
   const sourceRoles = sourceGuild.roles.cache
@@ -611,12 +611,13 @@ async function cloneRoles(sourceGuild, targetGuildId) {
     .sort((a, b) => a.position - b.position)
     .toJSON();
 
-  const targetRoles = await rest("GET", `/guilds/${targetGuildId}/roles`);
-  const existingNames = new Map(targetRoles?.map((r) => [r.name.toLowerCase(), r.id]) ?? []);
+  const existingNames = new Map(
+    targetGuild.roles.cache.map((r) => [r.name.toLowerCase(), r.id])
+  );
 
   const roleMap = new Map();
   const everyoneSrc = sourceGuild.roles.cache.find((r) => r.name === "@everyone");
-  const everyoneTgt = targetRoles?.find((r) => r.name === "@everyone");
+  const everyoneTgt = targetGuild.roles.cache.find((r) => r.name === "@everyone");
   if (everyoneSrc && everyoneTgt) roleMap.set(everyoneSrc.id, everyoneTgt.id);
 
   for (const role of sourceRoles) {
@@ -625,78 +626,88 @@ async function cloneRoles(sourceGuild, targetGuildId) {
       console.log(`  ↩ Già esistente: "${role.name}"`);
       continue;
     }
-    const created = await rest("POST", `/guilds/${targetGuildId}/roles`, {
-      name:        role.name,
-      color:       role.color,
-      hoist:       role.hoist,
-      mentionable: role.mentionable,
-      permissions: role.permissions.bitfield.toString(),
-    });
-    if (created) {
+    try {
+      const created = await targetGuild.roles.create({
+        name:        role.name,
+        color:       role.color,
+        hoist:       role.hoist,
+        mentionable: role.mentionable,
+        permissions: role.permissions.bitfield,
+        reason:      "clone",
+      });
       roleMap.set(role.id, created.id);
       console.log(`  ✅ "${role.name}"`);
-    } else {
-      console.error(`  ❌ Impossibile creare: "${role.name}"`);
+    } catch (e) {
+      console.error(`  ❌ Impossibile creare ruolo "${role.name}": ${e.message}`);
     }
     await sleep(400);
   }
 
-  // Applica gerarchia in un unico PATCH
-  const positions = sourceRoles
-    .map((r, idx) => ({ id: roleMap.get(r.id), position: idx + 1 }))
-    .filter((r) => r.id);
-  if (positions.length > 0) {
-    await rest("PATCH", `/guilds/${targetGuildId}/roles`, positions);
-    console.log(`  📐 Gerarchia applicata (${positions.length} ruoli)`);
+  // Applica gerarchia — setPosition su ogni ruolo dal basso verso l'alto
+  for (let i = 0; i < sourceRoles.length; i++) {
+    const targetId = roleMap.get(sourceRoles[i].id);
+    if (!targetId) continue;
+    try {
+      const targetRole = targetGuild.roles.cache.get(targetId);
+      if (targetRole) await targetRole.setPosition(i + 1);
+    } catch (_) {}
+    await sleep(200);
   }
+  console.log(`  📐 Gerarchia applicata`);
 
   return roleMap;
 }
 
 // ─── Clone server: converti permission overwrites ─────────────────────────────
 function convertOverwrites(overwrites, roleMap) {
-  return overwrites.cache
-    .map((ow) => {
-      const isRole = ow.type === "role" || ow.type === 0;
-      const targetId = isRole ? roleMap.get(ow.id) : ow.id;
-      if (isRole && !targetId) return null;
-      return {
-        id:    targetId,
-        type:  isRole ? 0 : 1,
-        allow: ow.allow.bitfield.toString(),
-        deny:  ow.deny.bitfield.toString(),
-      };
-    })
-    .filter(Boolean);
+  const result = [];
+  overwrites.cache.forEach((ow) => {
+    const isRole = ow.type === "role" || ow.type === 0;
+    const targetId = isRole ? roleMap.get(ow.id) : ow.id;
+    if (isRole && !targetId) return;
+    result.push({
+      id:    targetId,
+      type:  isRole ? "role" : "member",
+      allow: ow.allow.bitfield,
+      deny:  ow.deny.bitfield,
+    });
+  });
+  return result;
 }
 
 // ─── Clone server: singolo canale ────────────────────────────────────────────
-async function cloneChannel(ch, targetGuildId, parentId, roleMap) {
+async function cloneChannel(ch, targetGuild, parentId, roleMap) {
   const TYPE_MAP = {
-    GUILD_TEXT: 0, GUILD_VOICE: 2, GUILD_NEWS: 5,
-    GUILD_FORUM: 15, GUILD_STAGE_VOICE: 13,
+    GUILD_TEXT: "GUILD_TEXT", GUILD_VOICE: "GUILD_VOICE",
+    GUILD_NEWS: "GUILD_NEWS", GUILD_FORUM: "GUILD_FORUM",
+    GUILD_STAGE_VOICE: "GUILD_STAGE_VOICE",
   };
-  const type = TYPE_MAP[ch.type] ?? 0;
-  const body = {
-    name:                  ch.name,
-    type,
-    position:              ch.position,
-    permission_overwrites: convertOverwrites(ch.permissionOverwrites, roleMap),
-    ...(parentId               && { parent_id: parentId }),
-    ...(ch.topic               && { topic: ch.topic }),
-    ...(ch.nsfw                && { nsfw: ch.nsfw }),
-    ...(ch.rateLimitPerUser    && { rate_limit_per_user: ch.rateLimitPerUser }),
-    ...(type === 2             && { bitrate: ch.bitrate, user_limit: ch.userLimit }),
-  };
-  const created = await rest("POST", `/guilds/${targetGuildId}/channels`, body);
-  const icon = type === 2 ? "🔊" : type === 5 ? "📢" : type === 15 ? "💬" : "#";
-  if (created) console.log(`    ${icon} "${ch.name}"`);
-  else         console.error(`    ❌ Impossibile creare: "${ch.name}"`);
-  return created;
+  const type = TYPE_MAP[ch.type] ?? "GUILD_TEXT";
+  try {
+    const options = {
+      name:                 ch.name,
+      type,
+      position:             ch.position,
+      permissionOverwrites: convertOverwrites(ch.permissionOverwrites, roleMap),
+      ...(parentId            && { parent: parentId }),
+      ...(ch.topic            && { topic: ch.topic }),
+      ...(ch.nsfw             && { nsfw: ch.nsfw }),
+      ...(ch.rateLimitPerUser && { rateLimitPerUser: ch.rateLimitPerUser }),
+      ...(type === "GUILD_VOICE" && { bitrate: ch.bitrate, userLimit: ch.userLimit }),
+      reason: "clone",
+    };
+    const created = await targetGuild.channels.create(ch.name, options);
+    const icon = type === "GUILD_VOICE" ? "🔊" : type === "GUILD_NEWS" ? "📢" : type === "GUILD_FORUM" ? "💬" : "#";
+    console.log(`    ${icon} "${ch.name}"`);
+    return created;
+  } catch (e) {
+    console.error(`    ❌ Impossibile creare canale "${ch.name}": ${e.message}`);
+    return null;
+  }
 }
 
 // ─── Clone server: categorie + canali ────────────────────────────────────────
-async function cloneChannelsAndCategories(sourceGuild, targetGuildId, roleMap) {
+async function cloneChannelsAndCategories(sourceGuild, targetGuild, roleMap) {
   console.log(`\n📁 Clonazione categorie e canali...`);
   await sourceGuild.channels.fetch();
 
@@ -711,14 +722,20 @@ async function cloneChannelsAndCategories(sourceGuild, targetGuildId, roleMap) {
     .toJSON();
 
   for (const cat of categories) {
-    const created = await rest("POST", `/guilds/${targetGuildId}/channels`, {
-      name:                  cat.name,
-      type:                  4,
-      position:              cat.position,
-      permission_overwrites: convertOverwrites(cat.permissionOverwrites, roleMap),
-    });
-    if (created) console.log(`  📂 "${cat.name}"`);
-    else { console.error(`  ❌ Categoria: "${cat.name}"`); await sleep(400); continue; }
+    let createdCat = null;
+    try {
+      createdCat = await targetGuild.channels.create(cat.name, {
+        type:                 "GUILD_CATEGORY",
+        position:             cat.position,
+        permissionOverwrites: convertOverwrites(cat.permissionOverwrites, roleMap),
+        reason:               "clone",
+      });
+      console.log(`  📂 "${cat.name}"`);
+    } catch (e) {
+      console.error(`  ❌ Categoria "${cat.name}": ${e.message}`);
+      await sleep(400);
+      continue;
+    }
     await sleep(400);
 
     const children = sourceGuild.channels.cache
@@ -727,13 +744,13 @@ async function cloneChannelsAndCategories(sourceGuild, targetGuildId, roleMap) {
       .toJSON();
 
     for (const ch of children) {
-      await cloneChannel(ch, targetGuildId, created.id, roleMap);
+      await cloneChannel(ch, targetGuild, createdCat.id, roleMap);
       await sleep(400);
     }
   }
 
   for (const ch of orphans) {
-    await cloneChannel(ch, targetGuildId, null, roleMap);
+    await cloneChannel(ch, targetGuild, null, roleMap);
     await sleep(400);
   }
 }
@@ -781,11 +798,74 @@ async function runCloneMode() {
   await targetGuild.channels.fetch().catch(() => {});
   console.log(`✅ Target:   "${targetGuild.name}"`);
 
-  const roleMap = await cloneRoles(sourceGuild, TARGET_GUILD_ID);
+  const roleMap = await cloneRoles(sourceGuild, targetGuild);
   console.log(`✅ Ruoli clonati: ${roleMap.size}`);
 
-  await cloneChannelsAndCategories(sourceGuild, TARGET_GUILD_ID, roleMap);
+  await cloneChannelsAndCategories(sourceGuild, targetGuild, roleMap);
 }
+
+// ─── Clear server (canali + ruoli + categorie) ───────────────────────────────
+async function clearServer(guild) {
+  console.log(`\n🗑️  Pulizia "${guild.name}"...`);
+
+  await guild.channels.fetch();
+  const channels = guild.channels.cache.toJSON();
+  for (const ch of channels) {
+    try { await ch.delete("clearserver"); } catch (_) {}
+    await sleep(300);
+  }
+  console.log(`  ✅ Canali eliminati: ${channels.length}`);
+
+  await guild.roles.fetch();
+  const roles = guild.roles.cache
+    .filter((r) => r.name !== "@everyone" && r.managed === false && r.editable)
+    .toJSON();
+  for (const r of roles) {
+    try { await r.delete("clearserver"); } catch (_) {}
+    await sleep(300);
+  }
+  console.log(`  ✅ Ruoli eliminati: ${roles.length}`);
+}
+
+// ─── Comando ,clearserver ─────────────────────────────────────────────────────
+client.on("messageCreate", async (msg) => {
+  if (msg.author.id !== client.user.id) return;
+  if (msg.content.trim().toLowerCase() !== ",clearserver") return;
+  if (!SOURCE_GUILD_ID || !TARGET_GUILD_ID) {
+    return msg.reply("❌ SOURCE_GUILD_ID e TARGET_GUILD_ID non configurati nel .env");
+  }
+
+  console.log(`\n⚡ Comando ,clearserver ricevuto`);
+
+  try {
+    await msg.react("⏳").catch(() => {});
+
+    const sourceGuild = await client.guilds.fetch(SOURCE_GUILD_ID);
+    await sourceGuild.roles.fetch();
+    await sourceGuild.channels.fetch();
+
+    const targetGuild = await client.guilds.fetch(TARGET_GUILD_ID).catch(() => null);
+    if (!targetGuild) {
+      return msg.reply("❌ Guild target non trovata!");
+    }
+    await targetGuild.roles.fetch().catch(() => {});
+    await targetGuild.channels.fetch().catch(() => {});
+
+    // 1. Pulisci target
+    await clearServer(targetGuild);
+
+    // 2. Clona sorgente → target
+    console.log(`\n🖨️  Clonazione in corso...`);
+    const roleMap = await cloneRoles(sourceGuild, targetGuild);
+    await cloneChannelsAndCategories(sourceGuild, targetGuild, roleMap);
+
+    console.log(`\n🎯 ,clearserver completato!`);
+    await msg.react("✅").catch(() => {});
+  } catch (e) {
+    console.error(`💥 Errore ,clearserver: ${e.message}`);
+    await msg.react("❌").catch(() => {});
+  }
+});
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 client.on("ready", async () => {
@@ -801,16 +881,9 @@ client.on("ready", async () => {
     } else if (SOURCE_CATEGORY_ID && TARGET_CATEGORY_ID) {
       await runCategoryMode();
     } else {
-      console.error([
-        `❌ Configura almeno una modalità nel .env:`,
-        `   Clone server: SOURCE_GUILD_ID + TARGET_GUILD_ID`,
-        `   Thread:       SOURCE_THREAD_ID + TARGET_THREAD_ID`,
-        `   Categoria:    SOURCE_CATEGORY_ID + TARGET_CATEGORY_ID`,
-      ].join("\n"));
-      process.exit(1);
+      // Modalità standby: aspetta comandi
+      console.log(`\n👂 In ascolto comandi (,clearserver)...`);
     }
-
-    process.exit(0);
   } catch (e) {
     console.error(`💥 Errore nel ready handler: ${e.message}`);
     process.exit(1);
