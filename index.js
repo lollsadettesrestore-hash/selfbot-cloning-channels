@@ -9,6 +9,8 @@ const SOURCE_CATEGORY_ID = process.env.SOURCE_CATEGORY_ID?.trim() || null;
 const TARGET_CATEGORY_ID = process.env.TARGET_CATEGORY_ID?.trim() || null;
 const SOURCE_THREAD_ID   = process.env.SOURCE_THREAD_ID?.trim()   || null;
 const TARGET_THREAD_ID   = process.env.TARGET_THREAD_ID?.trim()   || null;
+const SOURCE_GUILD_ID    = process.env.SOURCE_GUILD_ID?.trim()    || null;
+const TARGET_GUILD_ID    = process.env.TARGET_GUILD_ID?.trim()    || null;
 
 const INVISIBLE_AVATAR =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
@@ -131,7 +133,24 @@ async function createAllWebhooks(channelPairs) {
   return result;
 }
 
-// ─── Scraping messaggi (video + foto) ────────────────────────────────────────
+// ─── Scraping messaggi via REST (funziona su canali e thread) ────────────────
+async function fetchMessagesREST(channelId, before = null) {
+  const params = new URLSearchParams({ limit: "100" });
+  if (before) params.set("before", before);
+  const res = await axios.get(
+    `https://discord.com/api/v10/channels/${channelId}/messages?${params}`,
+    { headers: { Authorization: TOKEN }, validateStatus: () => true }
+  );
+  if (res.status === 429) {
+    const retryAfter = (res.data?.retry_after ?? 3) + 0.5;
+    console.warn(`  ⏳ Rate limit messaggi — aspetto ${retryAfter}s`);
+    await sleep(retryAfter * 1000);
+    return fetchMessagesREST(channelId, before);
+  }
+  if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+  return res.data; // array di messaggi raw
+}
+
 async function scrapeMessages(channel) {
   const media = [];
   const seen = new Set();
@@ -140,28 +159,27 @@ async function scrapeMessages(channel) {
 
   while (true) {
     try {
-      const options = { limit: 100 };
-      if (lastId) options.before = lastId;
+      const messages = await fetchMessagesREST(channel.id, lastId);
+      if (!messages.length) break;
 
-      const messages = await channel.messages.fetch(options);
-      if (messages.size === 0) break;
-
-      const newLastId = messages.last()?.id;
+      const newLastId = messages[messages.length - 1]?.id;
       if (newLastId === lastId) {
         if (++stuckGuard >= 3) { console.warn(`⚠️ Loop bloccato in #${channel.name}, esco.`); break; }
       } else { stuckGuard = 0; }
       lastId = newLastId;
 
-      messages.forEach((msg) => {
-        msg.attachments.forEach((att) => {
-          const ext = getMediaExt(att.name);
+      for (const msg of messages) {
+        // Allegati (video + foto)
+        for (const att of (msg.attachments || [])) {
+          const ext = getMediaExt(att.filename || att.url);
           if (ext && !seen.has(att.url)) {
             seen.add(att.url);
             media.push({ url: att.url, ext, messageId: msg.id });
           }
-        });
-        msg.embeds.forEach((embed) => {
-          const videoUrl = embed.video?.url || embed.video?.proxyURL;
+        }
+        // Embed video + immagini
+        for (const embed of (msg.embeds || [])) {
+          const videoUrl = embed.video?.url || embed.video?.proxy_url;
           if (videoUrl && !seen.has(videoUrl)) {
             const ext = getMediaExt(videoUrl);
             if (ext) { seen.add(videoUrl); media.push({ url: videoUrl, ext, messageId: msg.id }); }
@@ -171,8 +189,8 @@ async function scrapeMessages(channel) {
             const ext = getMediaExt(imgUrl);
             if (ext) { seen.add(imgUrl); media.push({ url: imgUrl, ext, messageId: msg.id }); }
           }
-        });
-      });
+        }
+      }
 
       await sleep(500);
     } catch (e) {
@@ -507,13 +525,7 @@ async function findCategory(categoryId) {
 // ─── Trova un thread/channel per ID ──────────────────────────────────────────
 async function findChannelById(id) {
   try {
-    const channel = await client.channels.fetch(id);
-    console.log(`  🔍 channel type=${channel?.type} isThread=${channel?.isThread?.()} hasMessages=${!!channel?.messages} guild=${!!channel?.guild}`);
-    if (channel?.guild) {
-      await channel.guild.members.fetchMe().catch(() => {});
-      console.log(`  🔍 dopo fetchMe: hasMessages=${!!channel?.messages}`);
-    }
-    return channel;
+    return await client.channels.fetch(id);
   } catch (e) {
     console.error(`❌ Impossibile trovare canale/thread ${id}: ${e.message}`);
     return null;
@@ -590,17 +602,209 @@ async function runCategoryMode() {
   console.log(`\n🎯 Tutti i canali completati in ${totalMin} minuti!`);
 }
 
+// ─── Clone server: ruoli ─────────────────────────────────────────────────────
+async function cloneRoles(sourceGuild, targetGuildId) {
+  console.log(`\n🎭 Clonazione ruoli...`);
+
+  const sourceRoles = sourceGuild.roles.cache
+    .filter((r) => r.name !== "@everyone")
+    .sort((a, b) => a.position - b.position)
+    .toJSON();
+
+  const targetRoles = await rest("GET", `/guilds/${targetGuildId}/roles`);
+  const existingNames = new Map(targetRoles?.map((r) => [r.name.toLowerCase(), r.id]) ?? []);
+
+  const roleMap = new Map();
+  const everyoneSrc = sourceGuild.roles.cache.find((r) => r.name === "@everyone");
+  const everyoneTgt = targetRoles?.find((r) => r.name === "@everyone");
+  if (everyoneSrc && everyoneTgt) roleMap.set(everyoneSrc.id, everyoneTgt.id);
+
+  for (const role of sourceRoles) {
+    if (existingNames.has(role.name.toLowerCase())) {
+      roleMap.set(role.id, existingNames.get(role.name.toLowerCase()));
+      console.log(`  ↩ Già esistente: "${role.name}"`);
+      continue;
+    }
+    const created = await rest("POST", `/guilds/${targetGuildId}/roles`, {
+      name:        role.name,
+      color:       role.color,
+      hoist:       role.hoist,
+      mentionable: role.mentionable,
+      permissions: role.permissions.bitfield.toString(),
+    });
+    if (created) {
+      roleMap.set(role.id, created.id);
+      console.log(`  ✅ "${role.name}"`);
+    } else {
+      console.error(`  ❌ Impossibile creare: "${role.name}"`);
+    }
+    await sleep(400);
+  }
+
+  // Applica gerarchia in un unico PATCH
+  const positions = sourceRoles
+    .map((r, idx) => ({ id: roleMap.get(r.id), position: idx + 1 }))
+    .filter((r) => r.id);
+  if (positions.length > 0) {
+    await rest("PATCH", `/guilds/${targetGuildId}/roles`, positions);
+    console.log(`  📐 Gerarchia applicata (${positions.length} ruoli)`);
+  }
+
+  return roleMap;
+}
+
+// ─── Clone server: converti permission overwrites ─────────────────────────────
+function convertOverwrites(overwrites, roleMap) {
+  return overwrites.cache
+    .map((ow) => {
+      const isRole = ow.type === "role" || ow.type === 0;
+      const targetId = isRole ? roleMap.get(ow.id) : ow.id;
+      if (isRole && !targetId) return null;
+      return {
+        id:    targetId,
+        type:  isRole ? 0 : 1,
+        allow: ow.allow.bitfield.toString(),
+        deny:  ow.deny.bitfield.toString(),
+      };
+    })
+    .filter(Boolean);
+}
+
+// ─── Clone server: singolo canale ────────────────────────────────────────────
+async function cloneChannel(ch, targetGuildId, parentId, roleMap) {
+  const TYPE_MAP = {
+    GUILD_TEXT: 0, GUILD_VOICE: 2, GUILD_NEWS: 5,
+    GUILD_FORUM: 15, GUILD_STAGE_VOICE: 13,
+  };
+  const type = TYPE_MAP[ch.type] ?? 0;
+  const body = {
+    name:                  ch.name,
+    type,
+    position:              ch.position,
+    permission_overwrites: convertOverwrites(ch.permissionOverwrites, roleMap),
+    ...(parentId               && { parent_id: parentId }),
+    ...(ch.topic               && { topic: ch.topic }),
+    ...(ch.nsfw                && { nsfw: ch.nsfw }),
+    ...(ch.rateLimitPerUser    && { rate_limit_per_user: ch.rateLimitPerUser }),
+    ...(type === 2             && { bitrate: ch.bitrate, user_limit: ch.userLimit }),
+  };
+  const created = await rest("POST", `/guilds/${targetGuildId}/channels`, body);
+  const icon = type === 2 ? "🔊" : type === 5 ? "📢" : type === 15 ? "💬" : "#";
+  if (created) console.log(`    ${icon} "${ch.name}"`);
+  else         console.error(`    ❌ Impossibile creare: "${ch.name}"`);
+  return created;
+}
+
+// ─── Clone server: categorie + canali ────────────────────────────────────────
+async function cloneChannelsAndCategories(sourceGuild, targetGuildId, roleMap) {
+  console.log(`\n📁 Clonazione categorie e canali...`);
+  await sourceGuild.channels.fetch();
+
+  const categories = sourceGuild.channels.cache
+    .filter((c) => c.type === "GUILD_CATEGORY")
+    .sort((a, b) => a.position - b.position)
+    .toJSON();
+
+  const orphans = sourceGuild.channels.cache
+    .filter((c) => c.type !== "GUILD_CATEGORY" && !c.parentId)
+    .sort((a, b) => a.position - b.position)
+    .toJSON();
+
+  for (const cat of categories) {
+    const created = await rest("POST", `/guilds/${targetGuildId}/channels`, {
+      name:                  cat.name,
+      type:                  4,
+      position:              cat.position,
+      permission_overwrites: convertOverwrites(cat.permissionOverwrites, roleMap),
+    });
+    if (created) console.log(`  📂 "${cat.name}"`);
+    else { console.error(`  ❌ Categoria: "${cat.name}"`); await sleep(400); continue; }
+    await sleep(400);
+
+    const children = sourceGuild.channels.cache
+      .filter((c) => c.parentId === cat.id)
+      .sort((a, b) => a.position - b.position)
+      .toJSON();
+
+    for (const ch of children) {
+      await cloneChannel(ch, targetGuildId, created.id, roleMap);
+      await sleep(400);
+    }
+  }
+
+  for (const ch of orphans) {
+    await cloneChannel(ch, targetGuildId, null, roleMap);
+    await sleep(400);
+  }
+}
+
+// ─── REST helper con retry 429 ────────────────────────────────────────────────
+async function rest(method, path, body = null, retries = 6) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await axios({
+        method,
+        url: `https://discord.com/api/v10${path}`,
+        data: body,
+        headers: { Authorization: TOKEN, "Content-Type": "application/json" },
+        validateStatus: () => true,
+      });
+      if (res.status === 429) {
+        const wait = (res.data?.retry_after ?? 3) + 0.5;
+        console.warn(`  ⏳ Rate limit ${path} — aspetto ${wait}s`);
+        await sleep(wait * 1000);
+        continue;
+      }
+      if (res.status >= 200 && res.status < 300) return res.data;
+      console.warn(`  ⚠️ ${method} ${path} → ${res.status}`);
+      await sleep(1500 * (i + 1));
+    } catch (e) {
+      console.error(`  ❌ REST error: ${e.message}`);
+      await sleep(2000 * (i + 1));
+    }
+  }
+  return null;
+}
+
+// ─── Modalità clone server ────────────────────────────────────────────────────
+async function runCloneMode() {
+  console.log(`\n🖨️  Modalità CLONE SERVER: ${SOURCE_GUILD_ID} → ${TARGET_GUILD_ID}`);
+
+  const sourceGuild = await client.guilds.fetch(SOURCE_GUILD_ID);
+  await sourceGuild.roles.fetch();
+  await sourceGuild.channels.fetch();
+  console.log(`✅ Sorgente: "${sourceGuild.name}"`);
+
+  const targetInfo = await rest("GET", `/guilds/${TARGET_GUILD_ID}`);
+  if (!targetInfo) { console.error(`❌ Guild target non trovata!`); process.exit(1); }
+  console.log(`✅ Target:   "${targetInfo.name}"`);
+
+  const roleMap = await cloneRoles(sourceGuild, TARGET_GUILD_ID);
+  console.log(`✅ Ruoli clonati: ${roleMap.size}`);
+
+  await cloneChannelsAndCategories(sourceGuild, TARGET_GUILD_ID, roleMap);
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 client.on("ready", async () => {
   try {
     console.log(`\n🤖 Loggato come ${client.user.tag}`);
 
-    if (SOURCE_THREAD_ID && TARGET_THREAD_ID) {
+    if (SOURCE_GUILD_ID && TARGET_GUILD_ID) {
+      const start = Date.now();
+      await runCloneMode();
+      console.log(`\n🎯 Clone completato in ${((Date.now()-start)/1000).toFixed(1)}s!`);
+    } else if (SOURCE_THREAD_ID && TARGET_THREAD_ID) {
       await runThreadMode();
     } else if (SOURCE_CATEGORY_ID && TARGET_CATEGORY_ID) {
       await runCategoryMode();
     } else {
-      console.error(`❌ Configura almeno una modalità nel .env:\n   Thread:    SOURCE_THREAD_ID + TARGET_THREAD_ID\n   Categoria: SOURCE_CATEGORY_ID + TARGET_CATEGORY_ID`);
+      console.error([
+        `❌ Configura almeno una modalità nel .env:`,
+        `   Clone server: SOURCE_GUILD_ID + TARGET_GUILD_ID`,
+        `   Thread:       SOURCE_THREAD_ID + TARGET_THREAD_ID`,
+        `   Categoria:    SOURCE_CATEGORY_ID + TARGET_CATEGORY_ID`,
+      ].join("\n"));
       process.exit(1);
     }
 
