@@ -67,27 +67,21 @@ async function sendWithRetry(webhookUrl, payload, retries = 5) {
 async function scrapeChannel(channel) {
   const videos = [];
   console.log(`▶ Scraping #${channel.name}...`);
-
   let lastId = null;
   while (true) {
     const options = { limit: 100 };
     if (lastId) options.before = lastId;
-
     const messages = await channel.messages.fetch(options);
     if (messages.size === 0) break;
-
     messages.forEach((msg) => {
       msg.attachments.forEach((att) => {
-        if (VIDEO_EXTENSIONS.some((ext) => att.name?.toLowerCase().endsWith(ext))) {
+        if (VIDEO_EXTENSIONS.some((ext) => att.name?.toLowerCase().endsWith(ext)))
           videos.push(att.url);
-        }
       });
     });
-
     lastId = messages.last()?.id;
     await sleep(1000);
   }
-
   console.log(`✅ #${channel.name} → ${videos.length} video trovati`);
   return videos;
 }
@@ -98,13 +92,11 @@ async function mirrorChannel(sourceChannel, targetChannel) {
     console.error(`❌ Webhook fallito per #${targetChannel.name}, salto.`);
     return;
   }
-
   const videos = await scrapeChannel(sourceChannel);
   if (videos.length === 0) {
     console.log(`⚠️ Nessun video in #${sourceChannel.name}, salto.`);
     return;
   }
-
   const pairs = [];
   for (let i = 0; i < videos.length; i += 2) pairs.push(videos.slice(i, i + 2));
 
@@ -130,47 +122,57 @@ async function mirrorChannel(sourceChannel, targetChannel) {
   console.log(`🏁 #${sourceChannel.name} → #${targetChannel.name} completato!`);
 }
 
+// ─── Cerca una categoria in TUTTI i server ────────────────────────────────────
+
+async function findCategoryChannels(categoryId) {
+  for (const guild of client.guilds.cache.values()) {
+    await guild.channels.fetch();
+    const category = guild.channels.cache.get(categoryId);
+    if (category) {
+      const channels = guild.channels.cache
+        .filter((ch) => ch.parentId === categoryId && ch.isText())
+        .sort((a, b) => a.position - b.position)
+        .toJSON();
+      console.log(`📌 Categoria trovata in "${guild.name}" → ${channels.length} canali`);
+      return { guild, channels };
+    }
+  }
+  return null;
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 client.on("ready", async () => {
   console.log(`\n🤖 Loggato come ${client.user.tag}`);
   console.log(`📋 Guild in cache: ${client.guilds.cache.size}`);
-  console.log(`SOURCE_CATEGORY_ID: "${SOURCE_CATEGORY_ID}"`);
-  console.log(`TARGET_CATEGORY_ID: "${TARGET_CATEGORY_ID}"`);
 
-  for (const guild of client.guilds.cache.values()) {
-    console.log(`\n📌 Server: ${guild.name} (${guild.id})`);
+  // Cerca sorgente e target in server diversi
+  const source = await findCategoryChannels(SOURCE_CATEGORY_ID);
+  const target = await findCategoryChannels(TARGET_CATEGORY_ID);
 
-    await guild.channels.fetch();
-    console.log(`Canali in cache dopo fetch: ${guild.channels.cache.size}`);
-
-    const sourceCategory = guild.channels.cache.get(SOURCE_CATEGORY_ID);
-    const targetCategory = guild.channels.cache.get(TARGET_CATEGORY_ID);
-
-    console.log(`Sorgente → ${sourceCategory ? sourceCategory.name : "❌ NON TROVATA"}`);
-    console.log(`Target   → ${targetCategory ? targetCategory.name : "❌ NON TROVATA"}`);
-
-    if (!sourceCategory || !targetCategory) continue;
-
-    const sourceChannels = guild.channels.cache
-      .filter((ch) => ch.parentId === SOURCE_CATEGORY_ID && ch.isText())
-      .sort((a, b) => a.position - b.position)
-      .toJSON();
-
-    const targetChannels = guild.channels.cache
-      .filter((ch) => ch.parentId === TARGET_CATEGORY_ID && ch.isText())
-      .sort((a, b) => a.position - b.position)
-      .toJSON();
-
-    console.log(`📂 ${sourceChannels.length} canali sorgente | ${targetChannels.length} canali target`);
-
-    const pairs = sourceChannels
-      .map((src, i) => ({ source: src, target: targetChannels[i] }))
-      .filter((p) => p.source && p.target);
-
-    await Promise.all(pairs.map(({ source, target }) => mirrorChannel(source, target)));
-
-    console.log("\n🎯 Tutti i canali completati!");
+  if (!source) {
+    console.error(`❌ Categoria sorgente ${SOURCE_CATEGORY_ID} non trovata in nessun server!`);
+    process.exit(1);
+  }
+  if (!target) {
+    console.error(`❌ Categoria target ${TARGET_CATEGORY_ID} non trovata in nessun server!`);
+    process.exit(1);
   }
 
+  console.log(`\n📂 Sorgente: ${source.channels.length} canali`);
+  console.log(`📂 Target:   ${target.channels.length} canali`);
+
+  // Abbina canali per posizione
+  const pairs = source.channels
+    .map((src, i) => ({ source: src, target: target.channels[i] }))
+    .filter((p) => p.source && p.target);
+
+  console.log(`\n🔗 Coppie di canali abbinate: ${pairs.length}`);
+
+  // Avvia tutti in parallelo
+  await Promise.all(pairs.map(({ source, target }) => mirrorChannel(source, target)));
+
+  console.log("\n🎯 Tutti i canali completati!");
   process.exit(0);
 });
 
