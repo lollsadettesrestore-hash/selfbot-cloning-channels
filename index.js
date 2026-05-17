@@ -775,9 +775,11 @@ async function runCloneMode() {
   await sourceGuild.channels.fetch();
   console.log(`✅ Sorgente: "${sourceGuild.name}"`);
 
-  const targetInfo = await rest("GET", `/guilds/${TARGET_GUILD_ID}`);
-  if (!targetInfo) { console.error(`❌ Guild target non trovata!`); process.exit(1); }
-  console.log(`✅ Target:   "${targetInfo.name}"`);
+  const targetGuild = await client.guilds.fetch(TARGET_GUILD_ID).catch(() => null);
+  if (!targetGuild) { console.error(`❌ Guild target non trovata (assicurati che l'account sia nel server target!)`); process.exit(1); }
+  await targetGuild.roles.fetch().catch(() => {});
+  await targetGuild.channels.fetch().catch(() => {});
+  console.log(`✅ Target:   "${targetGuild.name}"`);
 
   const roleMap = await cloneRoles(sourceGuild, TARGET_GUILD_ID);
   console.log(`✅ Ruoli clonati: ${roleMap.size}`);
