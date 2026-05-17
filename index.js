@@ -2,6 +2,7 @@ require("dotenv").config();
 const { Client } = require("discord.js-selfbot-v13");
 const axios = require("axios");
 const fs = require("fs");
+const FormData = require("form-data");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const SOURCE_CATEGORY_ID = process.env.SOURCE_CATEGORY_ID?.trim();
@@ -24,14 +25,9 @@ function loadProgress(channelId) {
   return 0;
 }
 
-// ─── Crea canale testo nel server target ──────────────────────────────────────
-
 async function createChannel(guild, name, categoryId) {
   try {
-    const ch = await guild.channels.create(name, {
-      type: "GUILD_TEXT",
-      parent: categoryId,
-    });
+    const ch = await guild.channels.create(name, { type: "GUILD_TEXT", parent: categoryId });
     console.log(`✅ Canale creato: #${ch.name}`);
     return ch;
   } catch (e) {
@@ -39,8 +35,6 @@ async function createChannel(guild, name, categoryId) {
     return null;
   }
 }
-
-// ─── Crea webhook ─────────────────────────────────────────────────────────────
 
 async function createWebhook(channelId) {
   try {
@@ -58,24 +52,68 @@ async function createWebhook(channelId) {
   }
 }
 
-async function sendWithRetry(webhookUrl, payload, retries = 5) {
+// ─── Scarica video come buffer ────────────────────────────────────────────────
+
+async function downloadVideo(url) {
+  try {
+    const res = await axios.get(url, { responseType: "arraybuffer", timeout: 60000 });
+    return Buffer.from(res.data);
+  } catch (e) {
+    console.error(`❌ Errore download: ${e.message}`);
+    return null;
+  }
+}
+
+// ─── Invia coppia di video come file rinominati SENSATIONAL ───────────────────
+
+async function sendPairWithRetry(webhookUrl, pair, pairIndex, retries = 5) {
+  // Scarica tutti i buffer PRIMA di costruire il form
+  const files = [];
+  for (let i = 0; i < pair.length; i++) {
+    const { url, ext } = pair[i];
+    console.log(`  ⬇️  Download video ${i + 1}/${pair.length}...`);
+    const buffer = await downloadVideo(url);
+    if (!buffer) {
+      console.warn(`  ⚠️  Buffer nullo per il video ${i + 1}, salto.`);
+      continue;
+    }
+    const filename = `SENSATIONAL${pair.length > 1 ? `_${i + 1}` : ""}${ext}`;
+    files.push({ buffer, filename });
+  }
+
+  if (files.length === 0) {
+    console.error(`  ❌ Nessun file scaricato per la coppia #${pairIndex + 1}, salto invio.`);
+    return false;
+  }
+
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
-      const res = await axios.post(webhookUrl, payload, {
-        headers: { "Content-Type": "application/json" },
-        validateStatus: () => true,
+      const form = new FormData();
+      form.append("payload_json", JSON.stringify({ username: "SENSATIONAL" }));
+
+      files.forEach(({ buffer, filename }, i) => {
+        form.append(`files[${i}]`, buffer, { filename, contentType: "video/mp4" });
       });
+
+      const res = await axios.post(webhookUrl, form, {
+        headers: form.getHeaders(),
+        validateStatus: () => true,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        timeout: 120000,
+      });
+
       if (res.status === 429) {
         const retryAfter = res.data?.retry_after || 5;
-        console.log(`⏳ Rate limit — aspetto ${retryAfter}s`);
+        console.log(`  ⏳ Rate limit — aspetto ${retryAfter}s`);
         await sleep(retryAfter * 1000);
         continue;
       }
       if (res.status === 200 || res.status === 204) return true;
-      console.warn(`⚠️ Status ${res.status} — ritento (${attempt + 1}/${retries})`);
+      console.warn(`  ⚠️ Status ${res.status} — ritento (${attempt + 1}/${retries})`);
       await sleep(3000);
     } catch (e) {
-      console.error(`❌ Errore invio: ${e.message} — ritento (${attempt + 1}/${retries})`);
+      console.error(`  ❌ Errore invio: ${e.message} — ritento (${attempt + 1}/${retries})`);
       await sleep(5000);
     }
   }
@@ -83,7 +121,7 @@ async function sendWithRetry(webhookUrl, payload, retries = 5) {
 }
 
 async function scrapeChannel(channel) {
-  const videos = [];
+  const videos = []; // { url, ext }
   console.log(`▶ Scraping #${channel.name}...`);
   let lastId = null;
   while (true) {
@@ -93,8 +131,8 @@ async function scrapeChannel(channel) {
     if (messages.size === 0) break;
     messages.forEach((msg) => {
       msg.attachments.forEach((att) => {
-        if (VIDEO_EXTENSIONS.some((ext) => att.name?.toLowerCase().endsWith(ext)))
-          videos.push(att.url);
+        const ext = VIDEO_EXTENSIONS.find((e) => att.name?.toLowerCase().endsWith(e));
+        if (ext) videos.push({ url: att.url, ext });
       });
     });
     lastId = messages.last()?.id;
@@ -115,17 +153,16 @@ async function mirrorChannel(sourceChannel, targetChannel) {
     console.log(`⚠️ Nessun video in #${sourceChannel.name}, salto.`);
     return;
   }
+
+  // Coppie da 2
   const pairs = [];
   for (let i = 0; i < videos.length; i += 2) pairs.push(videos.slice(i, i + 2));
 
   const startFrom = loadProgress(sourceChannel.id);
-  console.log(`▶ #${sourceChannel.name} — riprendo da coppia #${startFrom + 1}/${pairs.length}`);
+  console.log(`▶ #${sourceChannel.name} — riprendo da #${startFrom + 1}/${pairs.length}`);
 
   for (let i = startFrom; i < pairs.length; i++) {
-    const ok = await sendWithRetry(webhookUrl, {
-      username: "SENSATIONAL",
-      content: pairs[i].join("\n"),
-    });
+    const ok = await sendPairWithRetry(webhookUrl, pairs[i], i);
     if (ok) {
       saveProgress(sourceChannel.id, i + 1);
       console.log(`  [#${sourceChannel.name}] ${i + 1}/${pairs.length} ✅`);
@@ -149,14 +186,12 @@ async function findCategory(categoryId) {
         .filter((ch) => ch.parentId === categoryId && ch.isText())
         .sort((a, b) => a.position - b.position)
         .toJSON();
-      console.log(`📌 Categoria "${category.name}" in "${guild.name}" → ${channels.length} canali`);
+      console.log(`📌 "${category.name}" in "${guild.name}" → ${channels.length} canali`);
       return { guild, category, channels };
     }
   }
   return null;
 }
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 
 client.on("ready", async () => {
   console.log(`\n🤖 Loggato come ${client.user.tag}`);
@@ -167,10 +202,9 @@ client.on("ready", async () => {
   if (!source) { console.error(`❌ Categoria sorgente non trovata!`); process.exit(1); }
   if (!target) { console.error(`❌ Categoria target non trovata!`); process.exit(1); }
 
-  // Crea i canali mancanti nel target copiando i nomi dalla sorgente
   let targetChannels = target.channels;
   if (targetChannels.length === 0) {
-    console.log(`\n⚙️ Nessun canale nel target — li creo ora...`);
+    console.log(`\n⚙️ Target vuoto — creo i canali...`);
     for (const srcCh of source.channels) {
       const newCh = await createChannel(target.guild, srcCh.name, TARGET_CATEGORY_ID);
       if (newCh) targetChannels.push(newCh);
@@ -178,8 +212,7 @@ client.on("ready", async () => {
     }
   }
 
-  console.log(`\n📂 Sorgente: ${source.channels.length} canali`);
-  console.log(`📂 Target:   ${targetChannels.length} canali`);
+  console.log(`\n📂 Sorgente: ${source.channels.length} | Target: ${targetChannels.length}`);
 
   const pairs = source.channels
     .map((src, i) => ({ source: src, target: targetChannels[i] }))
