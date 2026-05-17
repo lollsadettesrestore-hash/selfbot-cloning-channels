@@ -24,6 +24,24 @@ function loadProgress(channelId) {
   return 0;
 }
 
+// ─── Crea canale testo nel server target ──────────────────────────────────────
+
+async function createChannel(guild, name, categoryId) {
+  try {
+    const ch = await guild.channels.create(name, {
+      type: "GUILD_TEXT",
+      parent: categoryId,
+    });
+    console.log(`✅ Canale creato: #${ch.name}`);
+    return ch;
+  } catch (e) {
+    console.error(`❌ Errore creazione canale ${name}: ${e.message}`);
+    return null;
+  }
+}
+
+// ─── Crea webhook ─────────────────────────────────────────────────────────────
+
 async function createWebhook(channelId) {
   try {
     const res = await axios.post(
@@ -122,9 +140,7 @@ async function mirrorChannel(sourceChannel, targetChannel) {
   console.log(`🏁 #${sourceChannel.name} → #${targetChannel.name} completato!`);
 }
 
-// ─── Cerca una categoria in TUTTI i server ────────────────────────────────────
-
-async function findCategoryChannels(categoryId) {
+async function findCategory(categoryId) {
   for (const guild of client.guilds.cache.values()) {
     await guild.channels.fetch();
     const category = guild.channels.cache.get(categoryId);
@@ -133,8 +149,8 @@ async function findCategoryChannels(categoryId) {
         .filter((ch) => ch.parentId === categoryId && ch.isText())
         .sort((a, b) => a.position - b.position)
         .toJSON();
-      console.log(`📌 Categoria trovata in "${guild.name}" → ${channels.length} canali`);
-      return { guild, channels };
+      console.log(`📌 Categoria "${category.name}" in "${guild.name}" → ${channels.length} canali`);
+      return { guild, category, channels };
     }
   }
   return null;
@@ -144,32 +160,33 @@ async function findCategoryChannels(categoryId) {
 
 client.on("ready", async () => {
   console.log(`\n🤖 Loggato come ${client.user.tag}`);
-  console.log(`📋 Guild in cache: ${client.guilds.cache.size}`);
 
-  // Cerca sorgente e target in server diversi
-  const source = await findCategoryChannels(SOURCE_CATEGORY_ID);
-  const target = await findCategoryChannels(TARGET_CATEGORY_ID);
+  const source = await findCategory(SOURCE_CATEGORY_ID);
+  const target = await findCategory(TARGET_CATEGORY_ID);
 
-  if (!source) {
-    console.error(`❌ Categoria sorgente ${SOURCE_CATEGORY_ID} non trovata in nessun server!`);
-    process.exit(1);
-  }
-  if (!target) {
-    console.error(`❌ Categoria target ${TARGET_CATEGORY_ID} non trovata in nessun server!`);
-    process.exit(1);
+  if (!source) { console.error(`❌ Categoria sorgente non trovata!`); process.exit(1); }
+  if (!target) { console.error(`❌ Categoria target non trovata!`); process.exit(1); }
+
+  // Crea i canali mancanti nel target copiando i nomi dalla sorgente
+  let targetChannels = target.channels;
+  if (targetChannels.length === 0) {
+    console.log(`\n⚙️ Nessun canale nel target — li creo ora...`);
+    for (const srcCh of source.channels) {
+      const newCh = await createChannel(target.guild, srcCh.name, TARGET_CATEGORY_ID);
+      if (newCh) targetChannels.push(newCh);
+      await sleep(500);
+    }
   }
 
   console.log(`\n📂 Sorgente: ${source.channels.length} canali`);
-  console.log(`📂 Target:   ${target.channels.length} canali`);
+  console.log(`📂 Target:   ${targetChannels.length} canali`);
 
-  // Abbina canali per posizione
   const pairs = source.channels
-    .map((src, i) => ({ source: src, target: target.channels[i] }))
+    .map((src, i) => ({ source: src, target: targetChannels[i] }))
     .filter((p) => p.source && p.target);
 
-  console.log(`\n🔗 Coppie di canali abbinate: ${pairs.length}`);
+  console.log(`🔗 Coppie abbinate: ${pairs.length}\n`);
 
-  // Avvia tutti in parallelo
   await Promise.all(pairs.map(({ source, target }) => mirrorChannel(source, target)));
 
   console.log("\n🎯 Tutti i canali completati!");
